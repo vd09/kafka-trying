@@ -1,106 +1,175 @@
 package main
 
 import (
-	"fmt"
+	"context"
 	"log"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
-	ckafka "github.com/confluentinc/confluent-kafka-go/kafka"
+	"github.com/IBM/sarama"
+)
+
+const (
+	brokers          = "localhost:9092"
+	topic            = "my-topic"
+	numPods          = 3 // Number of pods (consumer instances)
+	numWorkersPerPod = 5 // Number of worker threads per pod
+	processingTime   = 10 * time.Millisecond
+	consumerGroupID  = "my-consumer-group" // Use the same group ID for all pods
 )
 
 func main() {
-	// Kafka configuration
-	brokers := "localhost:9092"
-	topic := "my-topic"
-
-	// Number of partitions/consumers
-	numPartitions := 10
-	numWorkersPerPartition := 5
+	// Sarama logger
+	sarama.Logger = log.New(os.Stdout, "[Sarama] ", log.LstdFlags)
 
 	var wg sync.WaitGroup
-	wg.Add(numPartitions)
+	wg.Add(numPods)
 
-	for partition := 0; partition < numPartitions; partition++ {
-		go func(partition int) {
+	for i := 0; i < numPods; i++ {
+		go func(podID int) {
 			defer wg.Done()
-			consumePartition(brokers, topic, partition, numWorkersPerPartition)
-		}(partition)
-	}
-
-	wg.Wait()
-}
-
-func consumePartition(brokers, topic string, partition, numWorkers int) {
-	// Create a new consumer for a specific partition
-	consumer, err := ckafka.NewConsumer(&ckafka.ConfigMap{
-		"bootstrap.servers":      brokers,
-		"group.id":               fmt.Sprintf("consumer-group-%d", partition),
-		"auto.offset.reset":      "earliest",
-		"enable.auto.commit":     false,
-		"go.events.channel.size": 100000,
-	})
-	if err != nil {
-		log.Fatalf("Failed to create consumer: %s", err)
-	}
-	defer consumer.Close()
-
-	// Assign specific partition
-	topicPartition := []ckafka.TopicPartition{
-		ckafka.TopicPartition{Topic: &topic, Partition: int32(partition)},
-	}
-	err = consumer.Assign(topicPartition)
-	if err != nil {
-		log.Fatalf("Failed to assign partition %d: %s", partition, err)
-	}
-
-	log.Printf("Consumer for partition %d started", partition)
-
-	// Channel to distribute messages to workers
-	messageChan := make(chan *ckafka.Message, 1000)
-
-	// WaitGroup for workers
-	var workerWg sync.WaitGroup
-	workerWg.Add(numWorkers)
-
-	// Start worker goroutines
-	for i := 0; i < numWorkers; i++ {
-		go func(workerID int) {
-			defer workerWg.Done()
-			processMessages(partition, workerID, messageChan)
+			consumeNewPod(podID)
 		}(i)
 	}
 
-	// Consume messages and send to messageChan
-	for {
-		msg, err := consumer.ReadMessage(-1)
-		if err != nil {
-			if e, ok := err.(ckafka.Error); ok && e.Code() == ckafka.ErrAllBrokersDown {
-				log.Printf("All brokers down: %v", err)
-				break
-			} else {
-				log.Printf("Consumer error: %v (%v)\n", err, msg)
-				continue
-			}
-		}
-		messageChan <- msg
-	}
-
-	// Close the message channel after consumption is done
-	close(messageChan)
-
-	// Wait for workers to finish processing
-	workerWg.Wait()
-
-	log.Printf("Consumer for partition %d exiting", partition)
+	// Wait for all pods to finish (they won't in this example)
+	wg.Wait()
 }
 
-func processMessages(partition, workerID int, messages <-chan *ckafka.Message) {
-	for msg := range messages {
-		// Simulate message processing
-		log.Printf("Partition %d - Worker %d processing message: %s\n", partition, workerID, string(msg.Value))
+func consumeNewPod(podID int) {
+	// Consumer group configuration
+	config := sarama.NewConfig()
+	config.Version = sarama.V2_8_0_0
+	config.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategyRange
+	config.Consumer.Offsets.Initial = sarama.OffsetOldest
+	config.Consumer.Group.Session.Timeout = 10 * time.Second
+	config.Consumer.MaxProcessingTime = 500 * time.Millisecond
 
-		// Simulate processing time
-		time.Sleep(10 * time.Millisecond)
+	// Manual offset management
+	config.Consumer.Offsets.AutoCommit.Enable = false
+
+	// All pods use the same consumer group ID
+	groupID := consumerGroupID
+
+	// Create a new consumer group
+	consumerGroup, err := sarama.NewConsumerGroup([]string{brokers}, groupID, config)
+	if err != nil {
+		log.Fatalf("[Pod %d] Error creating consumer group client: %v", podID, err)
 	}
+	defer consumerGroup.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Trap SIGINT and SIGTERM to trigger a shutdown.
+	sigchan := make(chan os.Signal, 1)
+	signal.Notify(sigchan, os.Interrupt, syscall.SIGTERM)
+
+	// Consumer group handler
+	handler := &ConsumerGroupHandler{
+		podID:        podID,
+		numWorkers:   numWorkersPerPod,
+		processingWG: &sync.WaitGroup{},
+	}
+
+	// Run the consumer group in a goroutine
+	go func() {
+		for {
+			err := consumerGroup.Consume(ctx, []string{topic}, handler)
+			if err != nil {
+				log.Printf("[Pod %d] Error from consumer: %v", podID, err)
+				time.Sleep(time.Second)
+			}
+
+			if ctx.Err() != nil {
+				return
+			}
+		}
+	}()
+
+	// Wait for a termination signal
+	select {
+	case <-sigchan:
+		log.Printf("[Pod %d] Received shutdown signal", podID)
+		cancel()
+	case <-ctx.Done():
+	}
+
+	// Wait for all message processing to finish
+	handler.processingWG.Wait()
+	log.Printf("[Pod %d] Consumer group exited", podID)
+}
+
+// ConsumerGroupHandler represents a Sarama consumer group consumer
+type ConsumerGroupHandler struct {
+	podID        int
+	numWorkers   int
+	processingWG *sync.WaitGroup
+	messageChan  chan *sarama.ConsumerMessage
+	session      sarama.ConsumerGroupSession
+}
+
+// Setup is run before the consumer group starts consuming
+func (h *ConsumerGroupHandler) Setup(session sarama.ConsumerGroupSession) error {
+	log.Printf("[Pod %d] Consumer group handler setup", h.podID)
+
+	// Store the session for use in workers
+	h.session = session
+
+	// Initialize the message channel and worker pool
+	h.messageChan = make(chan *sarama.ConsumerMessage, 1000)
+	h.processingWG.Add(h.numWorkers)
+
+	for i := 0; i < h.numWorkers; i++ {
+		go h.worker(i)
+	}
+
+	return nil
+}
+
+// Cleanup is run after the consumer group stops consuming
+func (h *ConsumerGroupHandler) Cleanup(session sarama.ConsumerGroupSession) error {
+	log.Printf("[Pod %d] Consumer group handler cleanup", h.podID)
+	close(h.messageChan)
+	h.processingWG.Wait()
+	return nil
+}
+
+// ConsumeClaim processes messages from Kafka
+func (h *ConsumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	log.Printf("[Pod %d] Consuming partition %d", h.podID, claim.Partition())
+
+	for msg := range claim.Messages() {
+		h.messageChan <- msg
+	}
+
+	return nil
+}
+
+func (h *ConsumerGroupHandler) worker(workerID int) {
+	defer h.processingWG.Done()
+	for msg := range h.messageChan {
+		err := processMessage(h.podID, workerID, msg)
+		if err == nil {
+			// Mark message as processed after successful processing
+			h.session.MarkMessage(msg, "")
+		} else {
+			log.Printf("[Pod %d] Thread %d failed to process message offset %d: %v", h.podID, workerID, msg.Offset, err)
+			// Handle retries or send to DLQ as needed
+		}
+	}
+}
+
+func processMessage(podID, workerID int, msg *sarama.ConsumerMessage) error {
+	// Simulate message processing
+	log.Printf("[Pod %d] Thread %d processing message offset %d: %s", podID, workerID, msg.Offset, string(msg.Value))
+
+	// Simulate processing time
+	time.Sleep(processingTime)
+
+	// Return nil if processing is successful, or an error if it fails
+	return nil
 }
