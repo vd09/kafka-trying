@@ -59,14 +59,14 @@ func main() {
 		}
 	}()
 
-	// Publish messages every few seconds
-	ticker := time.NewTicker(5 * time.Second)
+	// Publish messages at ~50 messages per second
+	ticker := time.NewTicker(15 * time.Millisecond) // 1000ms / 20ms = 50 messages per second (5ms publish latency)
 	defer ticker.Stop()
 
 	i := 0
 	for {
 		<-ticker.C
-		message := fmt.Sprintf("Message number %d at %s", i, time.Now().Format(time.RFC3339))
+		message := fmt.Sprintf("Message number %d at %s", i, time.Now().Format(time.RFC3339Nano))
 		err = producer.Produce(&ckafka.Message{
 			TopicPartition: ckafka.TopicPartition{Topic: &topic, Partition: ckafka.PartitionAny},
 			Value:          []byte(message),
