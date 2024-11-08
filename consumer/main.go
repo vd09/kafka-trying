@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -13,6 +15,7 @@ import (
 )
 
 const (
+	podIdKey         = "podId"
 	brokers          = "localhost:9092"
 	topic            = "my-topic"
 	numPods          = 3 // Number of pods (consumer instances)
@@ -20,6 +23,8 @@ const (
 	processingTime   = 10 * time.Millisecond
 	consumerGroupID  = "my-consumer-group" // Use the same group ID for all pods
 )
+
+var syncMap sync.Map
 
 func main() {
 	// Sarama logger
@@ -61,8 +66,20 @@ func consumeNewPod(podID int) {
 	}
 	defer consumerGroup.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx := context.WithValue(context.Background(), podIdKey, podID)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	defer func() {
+		podnameList := make([]string, 0)
+		syncMap.Range(func(key, value interface{}) bool {
+			podnameList = append(podnameList, key.(string))
+			return true
+		})
+		sort.Strings(podnameList)
+		for _, pdn := range podnameList {
+			fmt.Println("pod-thread combination used", pdn)
+		}
+	}()
 
 	// Trap SIGINT and SIGTERM to trigger a shutdown.
 	sigchan := make(chan os.Signal, 1)
@@ -166,6 +183,7 @@ func (h *ConsumerGroupHandler) worker(workerID int) {
 func processMessage(podID, workerID int, msg *sarama.ConsumerMessage) error {
 	// Simulate message processing
 	log.Printf("[Pod %d] Thread %d processing message offset %d: %s", podID, workerID, msg.Offset, string(msg.Value))
+	syncMap.Store(fmt.Sprintf("POD_%d_WORKER_%d", podID, workerID), struct{}{})
 
 	// Simulate processing time
 	time.Sleep(processingTime)
